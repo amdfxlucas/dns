@@ -473,6 +473,63 @@ func (rr *RRSIG) Verify(k *DNSKEY, rrset []RR) error {
 	}
 }
 
+func (rr *RRSIG) VerifyWithPublicKey(pubkey ed25519.PublicKey, rrset []RR) error {
+	// First the easy checks
+	if !IsRRset(rrset) {
+		return ErrRRset
+	}
+
+	if rr.Algorithm != ED25519 {
+		return ErrRRset
+	}
+
+	// IsRRset checked that we have at least one RR and that the RRs in
+	// the set have consistent type, class, and name. Also check that type and
+	// class matches the RRSIG record.
+	if h0 := rrset[0].Header(); h0.Class != rr.Hdr.Class || h0.Rrtype != rr.TypeCovered {
+		return ErrRRset
+	}
+
+	// RFC 4035 5.3.2.  Reconstructing the Signed Data
+	// Copy the sig, except the rrsig data
+	sigwire := new(rrsigWireFmt)
+	sigwire.TypeCovered = rr.TypeCovered
+	sigwire.Algorithm = rr.Algorithm
+	sigwire.Labels = rr.Labels
+	sigwire.OrigTtl = rr.OrigTtl
+	sigwire.Expiration = rr.Expiration
+	sigwire.Inception = rr.Inception
+	sigwire.KeyTag = rr.KeyTag
+	sigwire.SignerName = CanonicalName(rr.SignerName)
+	// Create the desired binary blob
+	signeddata := make([]byte, DefaultMsgSize)
+	n, err := packSigWire(sigwire, signeddata)
+	if err != nil {
+		return err
+	}
+	signeddata = signeddata[:n]
+	wire, err := rawSignatureData(rrset, rr)
+	if err != nil {
+		return err
+	}
+
+	sigbuf := rr.sigBuf()           // Get the binary signature data
+	if rr.Algorithm == PRIVATEDNS { // PRIVATEOID
+		// TODO(miek)
+		// remove the domain name and assume its ours?
+	}
+
+	switch rr.Algorithm {
+	case ED25519:
+		if ed25519.Verify(pubkey, append(signeddata, wire...), sigbuf) {
+			return nil
+		}
+		return ErrSig
+	default:
+		return ErrAlg
+	}
+}
+
 // ValidityPeriod uses RFC1982 serial arithmetic to calculate
 // if a signature period is valid. If t is the zero time, the
 // current time is taken other t is. Returns true if the signature
