@@ -3,16 +3,71 @@
 package dns
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	//"github.com/amdfxlucas/scion-coredns/core/dnsserver"
+
+	//"github.com/coredns/coredns/plugin/pkg/nonwriter"
+
+	"github.com/netsec-ethz/scion-apps/pkg/pan"
+	"github.com/quic-go/quic-go"
 )
+
+const minDNSPacketSize = 512
+const maxQuicIdleTimeout = 5 * time.Minute
+
+// Writer is a type of ResponseWriter that captures the message, but never writes to the client.
+type NonWriter struct {
+	ResponseWriter
+	Msg *Msg
+	// protocol i.e. udp, tcp, quic
+	//proto string
+	data *[]byte
+}
+
+// New makes and returns a new NonWriter.
+func New(w ResponseWriter) *NonWriter { return &NonWriter{ResponseWriter: w} }
+
+// WriteMsg records the message, but doesn't write it itself.
+func (w *NonWriter) WriteMsg(res *Msg) error {
+	w.Msg = res
+	return nil
+}
+
+// DoHWriter is a nonwriter.Writer that adds more specific LocalAddr and RemoteAddr methods.
+type DoHWriter struct {
+	NonWriter
+
+	// raddr is the remote's address. This can be optionally set.
+	raddr net.Addr
+	// laddr is our address. This can be optionally set.
+	laddr net.Addr
+
+	// request is the HTTP request we're currently handling.
+	request *http.Request
+	// protocol i.e. udp, tcp, quic
+	//proto string
+}
+
+// RemoteAddr returns the remote address.
+func (d *DoHWriter) RemoteAddr() net.Addr { return d.raddr }
+
+// LocalAddr returns the local address.
+func (d *DoHWriter) LocalAddr() net.Addr { return d.laddr }
+
+// Request returns the HTTP request
+func (d *DoHWriter) Request() *http.Request { return d.request }
 
 // Default maximum number of TCP queries before we close the socket.
 const maxTCPQueries = 128
@@ -77,6 +132,9 @@ type response struct {
 	udpSession     *SessionUDP    // oob data to get egress interface right
 	pcSession      net.Addr       // address to use when writing to a generic net.PacketConn
 	writer         Writer         // writer to output the raw DNS bits
+
+	//qstream quic.Stream
+
 }
 
 // handleRefused returns a HandlerFunc that returns REFUSED for every request it gets.
@@ -190,8 +248,11 @@ type DecorateWriter func(Writer) Writer
 
 // A Server defines parameters for running an DNS server.
 type Server struct {
+	listen quic.Listener
 	// Address to listen on, ":dns" if empty.
 	Addr string
+
+	listenAddr net.Addr
 	// if "tcp" or "tcp-tls" (DNS over TLS) it will invoke a TCP listener, otherwise an UDP one
 	Net string
 	// TCP Listener to use, this is to aid in systemd's socket activation.
@@ -375,6 +436,229 @@ func (srv *Server) ActivateAndServe() error {
 		return srv.serveTCP(srv.Listener)
 	}
 	return &Error{err: "bad listeners"}
+}
+
+func (srv *Server) ActivateAndServeSQUIC() error {
+	unlock := unlockOnce(&srv.lock)
+	srv.lock.Lock()
+	defer unlock()
+
+	if srv.started {
+		return &Error{err: "server already started"}
+	}
+
+	srv.init()
+
+	if srv.PacketConn != nil {
+		// Check PacketConn interface's type is valid and value
+		// is not nil
+		if t, ok := srv.PacketConn.(*net.UDPConn); ok && t != nil {
+			if e := setUDPSocketOptions(t); e != nil {
+				return e
+			}
+		}
+		srv.started = true
+		unlock()
+		return srv.serveSQUIC(srv.PacketConn)
+	}
+	return &Error{err: ""}
+}
+
+func (srv *Server) serveSQUIC(p net.PacketConn) error {
+	srv.lock.Lock()
+
+	if srv.NotifyStartedFunc != nil {
+		srv.NotifyStartedFunc()
+	}
+
+	var wg sync.WaitGroup
+	defer func() {
+		wg.Wait()
+		close(srv.shutdown)
+	}()
+
+	//for srv.isStarted() {
+
+	if srv.TLSConfig == nil {
+		return errors.New("cannot run a QUIC server without TLS config")
+	}
+
+	// l, err := quic.Listen(p, s.tlsConfig, &quic.Config{MaxIdleTimeout: maxQuicIdleTimeout})
+	l, err := pan.ListenQUIC2(p, srv.TLSConfig, &quic.Config{MaxIdleTimeout: maxQuicIdleTimeout})
+	if err != nil {
+		return err
+	}
+	srv.listen = l
+	srv.listenAddr = l.Addr()
+	srv.lock.Unlock()
+
+	for srv.isStarted() {
+		session, err := srv.listen.Accept(context.Background())
+		if err != nil {
+			return err
+		}
+
+		go srv.handleQUICSession(session)
+	}
+	//}
+	return nil
+}
+
+func (s *Server) handleQUICSession(session quic.Connection) {
+	for {
+		// The stub to resolver DNS traffic follows a simple pattern in which
+		// the client sends a query, and the server provides a response.  This
+		// design specifies that for each subsequent query on a QUIC connection
+		// the client MUST select the next available client-initiated
+		// bidirectional stream
+		stream, err := session.AcceptStream(context.Background())
+		if err != nil {
+			fmt.Print("ERROR[session.AcceptStream]:" + err.Error())
+
+			_ = session.CloseWithError(0, "")
+			return
+		}
+		go func() {
+			s.handleQUICStream(stream, session)
+			_ = stream.Close()
+		}()
+	}
+}
+
+// handleQUICStream reads DNS queries from the stream, processes them,
+// and writes back the responses
+func (s *Server) handleQUICStream(stream quic.Stream, session quic.Connection) {
+	//var b []byte
+	var b []byte = s.udpPool.Get().([]byte)
+	defer s.udpPool.Put(b)
+
+	// The client MUST send the DNS query over the selected stream, and MUST
+	// indicate through the STREAM FIN mechanism that no further data will
+	// be sent on that stream.
+	// FIN is indicated via error so we should simply ignore it and
+	// check the size instead.
+	var fstTry bool = true
+
+	var buff *bytes.Buffer = bytes.NewBuffer(b)
+read:
+	//n, rerr := stream.Read(b)
+	n, rerr := stream.Read(buff.Bytes())
+	if rerr != nil {
+		fmt.Printf("stream.Read Error: %v\n", rerr.Error())
+	}
+	if n < 2 /* minDNSPacketSize*/ {
+		fmt.Printf("received invalid DNS query\n")
+
+		// Invalid DNS query, this stream should be ignored
+		if fstTry {
+			fstTry = false
+			goto read
+		}
+		return
+	}
+
+	msg := new(Msg)
+	msg_len := binary.BigEndian.Uint16(b[:2])
+	if int(msg_len) != n-2 {
+		panic(fmt.Sprintf("message size mismatch: %d vs %d", msg_len, n))
+	}
+	err := msg.Unpack(b[2:])
+	if err != nil {
+		fmt.Println(b[:n])
+		// Invalid content
+		fmt.Print("handleQUICStream encountered invalid content: " + err.Error())
+		return
+	}
+
+	// If any message sent on a DoQ connection contains an edns-tcp-keepalive EDNS(0) Option,
+	// this is a fatal error and the recipient of the defective message MUST forcibly abort
+	// the connection immediately.
+	// https://datatracker.ietf.org/doc/html/draft-ietf-dprive-dnsoquic-02#section-6.6.2
+	if opt := msg.IsEdns0(); opt != nil {
+		for _, option := range opt.Option {
+			// Check for EDNS TCP keepalive option
+			if option.Option() == EDNS0TCPKEEPALIVE {
+				// Already closing the connection so we don't care about the error
+				_ = session.CloseWithError(0, "")
+			}
+		}
+	}
+
+	// Consider renaming DoHWriter or creating a new struct for QUIC
+	//dw := &DoHWriter{laddr: s.listenAddr, raddr: session.RemoteAddr(), proto: "squic"}
+	//dw := &DoHWriter{laddr: s.listenAddr, raddr: session.RemoteAddr(), Writer: nonwriter.Writer{proto: "squic"}}
+	dw := &DoHWriter{laddr: s.listenAddr, raddr: session.RemoteAddr()}
+	//dw := &response{qstream: stream}
+
+	// We just call the normal chain handler - all error handling is done there.
+	// We should expect a packet to be returned that we can send to the client.
+	// ctx := context.WithValue(context.Background(), Key{}, s)
+	//s.ServeDNS(ctx, dw, msg)
+
+	s.serveDNSInternal(msg, b[2:], dw)
+
+	if dw.Msg == nil {
+		fmt.Println("message was nil -> stream closed!")
+		_ = stream.Close()
+		return
+	}
+	var response *Msg = dw.Msg
+
+	// Write the response
+	buf, _ := response.Pack()
+	/*
+		testMsg := new(Msg)
+		unpackErr := testMsg.Unpack(buf)
+		if unpackErr != nil {
+			fmt.Printf("cant unpack our own response ->just about to reply shit to client\n")
+		} else {
+			fmt.Printf("deep equal: %v\n", reflect.DeepEqual(response.Answer, testMsg.Answer))
+			fmt.Printf("nr of RRs in answer still equal: %v\n", len(response.Answer) == len(testMsg.Answer))
+			var strEqual bool = true
+			fmt.Print(response.Answer[0].String())
+			for i := 0; i < len(response.Answer); i++ {
+				strEqual = strEqual && response.Answer[i].String() == testMsg.Answer[i].String()
+				strEqual = strEqual && strings.HasPrefix(response.Answer[i].String(), "dummy.luki.test.home.	604800	IN	A")
+			}
+			fmt.Printf("elementwise str-equal: %v\n", strEqual)
+		}
+	*/
+
+	// fmt.Println("encoded response(without fst 2 bytes): ", buf)
+	n, e := stream.Write(addPrefix(buf))
+	fmt.Printf("wrote %d bytes to stream\n", len(buf)+2)
+
+	if e != nil {
+		fmt.Println(e.Error())
+
+		if err, ok := e.(net.Error); ok {
+			fmt.Printf("remote peer cancelled stream: %v\n", err.Error())
+		}
+		if err, ok := e.(*quic.StreamError); ok {
+			fmt.Printf("remote peer cancelled stream: %v\n", err.Error())
+		}
+		if err, ok := e.(*quic.TransportError); ok {
+			fmt.Printf("TransportError: %v\n", err.Error())
+		}
+		if err, ok := e.(*quic.ApplicationError); ok {
+			fmt.Printf("ApplicationError: %v\n", err.Error())
+		}
+
+		if n != len(buf) {
+			fmt.Printf("stream write failure! buffer had size %d but only %d was sent", len(buf), n)
+			panic("EXIT FAILURE")
+
+		}
+	}
+}
+
+// addPrefix adds a 2-byte prefix with the DNS message length.
+func addPrefix(b []byte) (m []byte) {
+	m = make([]byte, 2+len(b))
+	binary.BigEndian.PutUint16(m, uint16(len(b)))
+	copy(m[2:], b)
+
+	return m
 }
 
 // Shutdown shuts down a server. After a call to Shutdown, ListenAndServe and
@@ -602,6 +886,100 @@ func (srv *Server) serveUDPPacket(wg *sync.WaitGroup, m []byte, u net.PacketConn
 
 	srv.serveDNS(m, w)
 	wg.Done()
+}
+
+/*
+!
+Internal means: "nothing is sent here", as the ResponseWriter is a stub or NonWriter,
+and merely stores the computed response Msg
+
+	\param m contains the raw query
+	\param msg contains the unpacked query from m
+	\param[out] w
+*/
+func (srv *Server) serveDNSInternal(msg *Msg, m []byte, w ResponseWriter) {
+	dh, _, err := unpackMsgHdr(m, 0)
+	if err != nil {
+		// Let client hang, they are sending crap; any reply can be used to amplify.
+		return
+	}
+
+	req := new(Msg)
+	req.setHdr(dh)
+
+	switch action := srv.MsgAcceptFunc(dh); action {
+	case MsgAccept:
+		//if req.unpack(dh, m, off) == nil {
+		req = msg
+		break
+		//}
+
+	//	fallthrough
+	case MsgReject, MsgRejectNotImplemented:
+		opcode := req.Opcode
+		req.SetRcodeFormatError(req)
+		req.Zero = false
+		if action == MsgRejectNotImplemented {
+			req.Opcode = opcode
+			req.Rcode = RcodeNotImplemented
+		}
+
+		// Are we allowed to delete any OPT records here?
+		req.Ns, req.Answer, req.Extra = nil, nil, nil
+		func() {
+
+			//var data []byte
+			if srv.tsigProvider() != nil { // if no provider, dont check for the tsig (which is a longer check)
+				if t := msg.IsTsig(); t != nil {
+					fmt.Println("tsig rejected")
+					/*	data, w.tsigRequestMAC, err = TsigGenerateWithProvider(m, w.tsigProvider, w.tsigRequestMAC, w.tsigTimersOnly)
+						if err != nil {
+							return err
+						}
+						_, err = w.writer.Write(data)
+						return err
+					*/
+				}
+			}
+			// data, err = msg.Pack()
+		}()
+
+		w.WriteMsg(req)
+		fallthrough
+
+	case MsgIgnore:
+		/*	if w.udp != nil && cap(m) == srv.UDPSize {
+				srv.udpPool.Put(m[:srv.UDPSize])
+			}
+		*/
+
+		return
+	}
+
+	// var tsigStat error
+	if srv.tsigProvider() != nil {
+		if t := req.IsTsig(); t != nil {
+			tsigStat := TsigVerifyWithProvider(m, srv.tsigProvider(), "", false)
+			if tsigStat != nil {
+				//return err
+			}
+
+			data, _, err := TsigGenerateWithProvider(msg, srv.tsigProvider(), t.MAC, false)
+			if err != nil {
+				//return err
+			}
+			//_, err = w.writer.Write(data)
+			// return err
+			err = req.Unpack(data)
+			w.WriteMsg(req)
+		}
+	}
+
+	/*	if w.udp != nil && cap(m) == srv.UDPSize {
+		srv.udpPool.Put(m[:srv.UDPSize])
+	}*/
+
+	srv.Handler.ServeDNS(w, req) // Writes back to the client
 }
 
 func (srv *Server) serveDNS(m []byte, w *response) {

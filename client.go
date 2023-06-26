@@ -6,11 +6,17 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/netsec-ethz/scion-apps/pkg/pan"
+	"github.com/quic-go/quic-go"
+	"inet.af/netaddr"
 )
 
 const (
@@ -37,6 +43,10 @@ type Conn struct {
 	TsigSecret     map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
 	TsigProvider   TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
 	tsigRequestMAC string
+
+	quicEarlySession *pan.QUICEarlySession
+	//quicSession      *pan.QUICSession
+	qstream *quic.Stream
 }
 
 func (co *Conn) tsigProvider() TsigProvider {
@@ -110,20 +120,59 @@ func (c *Client) Dial(address string) (conn *Conn, err error) {
 func (c *Client) DialContext(ctx context.Context, address string) (conn *Conn, err error) {
 	// create a new dialer with the appropriate timeout
 	var d net.Dialer
+	var useTLS bool = false
+
+	conn = new(Conn)
+	network := c.Net
+	if network == "squic" {
+		var local netaddr.IPPort
+
+		/*		if len := len(r.cfg.OutboundIPs); len > 0 {
+				// loop until we have at least one suitable outboundIP address
+				for i := 0; i < len; i++ {
+					var outAddr string = r.cfg.OutboundIPs[i]
+					local, err = netaddr.ParseIPPort(outAddr)
+					if err != nil {
+						fmt.Printf("invalid outboundIPv4 address: %v \n", outAddr)
+					} else {
+						fmt.Printf("outip: %v\n", outAddr)
+						// exit loop, we have what we need
+						break
+					}
+				}
+			}*/
+
+		var hostForSNI string = "localhost" // hacky shortcut, because i know what domain-name my server's certificate is issued on ( that is 'localhost' amongst others)
+		// this has to be the domain name of the nameserver we are about to dial
+		// It is required for the crypto handshake to succeed.
+		// For production, we have to look this up with 'Reverse DNS Lookup (rDNS)' of the servers ('remote') IP address through one of the other bootstrap/root-servers
+		// TODO: create Method func hostSNIFromAddr( serverAddrToReverseLookup string, cfg *config.Config ) ( serverSNIToAddress string, error)
+		// NOTE: adguardteam/dnsproxy uses the Host portion of the remote address for this
+
+		var remote pan.UDPAddr
+		remote, err = pan.ParseUDPAddr(address)
+		if err != nil {
+			fmt.Printf("parse of pan.UPDAddr failed with: %v in dns.Client \n", address)
+		}
+		dialCtx, cancel := context.WithTimeout(ctx, c.getTimeoutForRequest(c.dialTimeout()))
+		defer cancel()
+		conn.quicEarlySession, err = pan.DialQUICEarly(dialCtx, local, remote, nil, nil, hostForSNI, c.TLSConfig, &quic.Config{MaxIdleTimeout: 5 * time.Minute})
+
+		if err != nil {
+			fmt.Printf("dialQUIC failed in dns.Client: %v \n", err.Error())
+		}
+		goto finished
+	} else if network == "" {
+		network = "udp"
+	}
 	if c.Dialer == nil {
 		d = net.Dialer{Timeout: c.getTimeoutForRequest(c.dialTimeout())}
 	} else {
 		d = *c.Dialer
 	}
 
-	network := c.Net
-	if network == "" {
-		network = "udp"
-	}
+	useTLS = strings.HasPrefix(network, "tcp") && strings.HasSuffix(network, "-tls")
 
-	useTLS := strings.HasPrefix(network, "tcp") && strings.HasSuffix(network, "-tls")
-
-	conn = new(Conn)
 	if useTLS {
 		network = strings.TrimSuffix(network, "-tls")
 
@@ -139,6 +188,7 @@ func (c *Client) DialContext(ctx context.Context, address string) (conn *Conn, e
 	} else {
 		conn.Conn, err = d.DialContext(ctx, network, address)
 	}
+finished:
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +216,10 @@ func (c *Client) Exchange(m *Msg, address string) (r *Msg, rtt time.Duration, er
 	if err != nil {
 		return nil, 0, err
 	}
-	defer co.Close()
+	if c.Net != "squic" {
+		defer co.Close()
+	}
+
 	return c.ExchangeWithConn(m, co)
 }
 
@@ -232,16 +285,20 @@ func (c *Client) exchangeContext(ctx context.Context, m *Msg, co *Conn) (r *Msg,
 			readDeadline = deadline
 		}
 	}
-	co.SetWriteDeadline(writeDeadline)
-	co.SetReadDeadline(readDeadline)
+	if c.Net != "squic" {
+		co.SetWriteDeadline(writeDeadline)
+		co.SetReadDeadline(readDeadline)
+	}
 
 	co.TsigSecret, co.TsigProvider = c.TsigSecret, c.TsigProvider
 
 	if err = co.WriteMsg(m); err != nil {
 		return nil, 0, err
 	}
+	//---------------------------------------------------------------
+	/* if c.Net == "squic" {
 
-	if isPacketConn(co.Conn) {
+	} else */if isPacketConn(co.Conn) {
 		for {
 			r, err = co.ReadMsg()
 			// Ignore replies with mismatched IDs because they might be
@@ -260,17 +317,62 @@ func (c *Client) exchangeContext(ctx context.Context, m *Msg, co *Conn) (r *Msg,
 	return r, rtt, err
 }
 
+var bufferPool sync.Pool
+
+// AcquireBuf returns an buf from pool
+func AcquireBuf(size uint16) []byte {
+	x := bufferPool.Get()
+	if x == nil {
+		return make([]byte, size)
+	}
+	buf := *(x.(*[]byte))
+	if cap(buf) < int(size) {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+// ReleaseBuf returns buf to pool
+func ReleaseBuf(buf []byte) {
+	bufferPool.Put(&buf)
+}
+
 // ReadMsg reads a message from the connection co.
 // If the received message contains a TSIG record the transaction signature
 // is verified. This method always tries to return the message, however if an
 // error is returned there are no guarantees that the returned message is a
 // valid representation of the packet read.
 func (co *Conn) ReadMsg() (*Msg, error) {
-	p, err := co.ReadMsgHeader(nil)
-	if err != nil {
-		return nil, err
-	}
+	var (
+		p   []byte
+		err error
+	)
 
+	if isDoQ := co.qstream != nil; isDoQ {
+
+		var msglength uint16
+		if err := binary.Read(*co.qstream, binary.BigEndian, &msglength); err != nil {
+			return nil, err
+		}
+		p = AcquireBuf(msglength)
+
+		// respBuf := p
+		// var buff *bytes.Buffer = bytes.NewBuffer(respBuf)
+		var n int
+		n, err = io.ReadFull(*co.qstream, p)
+		if err != nil {
+			fmt.Printf("readFull failed: %v read: %v \n", err.Error(), n)
+			return nil, err
+		}
+
+	} else {
+		//------------------------------------------
+		p, err = co.ReadMsgHeader(nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer ReleaseBuf(p)
 	m := new(Msg)
 	if err := m.Unpack(p); err != nil {
 		// If an error was returned, we still want to allow the user to use
@@ -369,10 +471,52 @@ func (co *Conn) WriteMsg(m *Msg) (err error) {
 	return err
 }
 
+// AddPrefix adds a 2-byte prefix with the DNS message length.
+/*func addPrefix(b []byte) (m []byte) {
+	m = make([]byte, 2+len(b))
+	binary.BigEndian.PutUint16(m, uint16(len(b)))
+	copy(m[2:], b)
+
+	return m
+}*/
+
 // Write implements the net.Conn Write method.
 func (co *Conn) Write(p []byte) (int, error) {
 	if len(p) > MaxMsgSize {
-		return 0, &Error{err: "message too large"}
+		return 0, errors.New("message too large")
+	}
+
+	var err error
+	if isDoQ := co.quicEarlySession != nil; isDoQ {
+		var stream quic.Stream
+
+		stream, err = co.quicEarlySession.OpenStreamSync(context.Background())
+
+		if err != nil {
+			fmt.Printf("failed to open Stream: %v \n", err.Error())
+		}
+
+		rawMsg := addPrefix(p)
+		if len(rawMsg) != len(p)+2 {
+			fmt.Printf("Add prefix failed! len(rawMsg): %v\n", len(rawMsg))
+		}
+		var n int
+		n, err = stream.Write(rawMsg)
+		if err != nil {
+			return n, fmt.Errorf("failed to write to a QUIC stream: %w", err)
+		}
+		if n != len(p)+2 {
+			fmt.Printf("wrote %v but was supposed to write %v", n, len(p)+2)
+		}
+
+		// The client MUST send the DNS query over the selected stream, and MUST
+		// indicate through the STREAM FIN mechanism that no further data will
+		// be sent on that stream. Note, that stream.Close() closes the
+		// write-direction of the stream, but does not prevent reading from it.
+		_ = stream.Close()
+		co.qstream = &stream
+		return n, nil
+
 	}
 
 	if isPacketConn(co.Conn) {
@@ -423,6 +567,17 @@ func ExchangeContext(ctx context.Context, m *Msg, a string) (r *Msg, err error) 
 	return r, err
 }
 
+// ExchangeContext performs a synchronous UDP query, like Exchange. It
+// additionally obeys deadlines from the passed Context.
+func ExchangeContextProto(ctx context.Context, m *Msg, a string, proto string) (r *Msg, err error) {
+
+	client := Client{Net: proto}
+	r, _, err = client.ExchangeContext(ctx, m, a)
+	// ignoring rtt to leave the original ExchangeContext API unchanged, but
+	// this function will go away
+	return r, err
+}
+
 // ExchangeConn performs a synchronous query. It sends the message m via the connection
 // c and waits for a reply. The connection c is not closed by ExchangeConn.
 // Deprecated: This function is going away, but can easily be mimicked:
@@ -431,7 +586,6 @@ func ExchangeContext(ctx context.Context, m *Msg, a string) (r *Msg, err error) 
 //	co.WriteMsg(m)
 //	in, _  := co.ReadMsg()
 //	co.Close()
-//
 func ExchangeConn(c net.Conn, m *Msg) (r *Msg, err error) {
 	println("dns: ExchangeConn: this function is deprecated")
 	co := new(Conn)
