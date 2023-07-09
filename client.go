@@ -49,6 +49,27 @@ type Conn struct {
 	qstream *quic.Stream
 }
 
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	if c.Conn == nil {
+		if c.qstream != nil {
+			return (*c.qstream).SetReadDeadline(t)
+		} else {
+			return nil
+		}
+	} else {
+		return c.Conn.SetReadDeadline(t)
+	}
+}
+
+func (c *Conn) Close() error {
+	if c.Conn == nil {
+		return nil
+	} else {
+		return c.Conn.Close()
+	}
+
+}
+
 func (co *Conn) tsigProvider() TsigProvider {
 	if co.TsigProvider != nil {
 		return co.TsigProvider
@@ -83,6 +104,12 @@ type Client struct {
 func Exchange(m *Msg, a string) (r *Msg, err error) {
 	client := Client{Net: "udp"}
 	r, _, err = client.Exchange(m, a)
+	return r, err
+}
+
+func ExchangeClient(c *Client, m *Msg, a string) (r *Msg, err error) {
+
+	r, _, err = c.Exchange(m, a)
 	return r, err
 }
 
@@ -433,6 +460,30 @@ func (co *Conn) ReadMsgHeader(hdr *Header) ([]byte, error) {
 
 // Read implements the net.Conn read method.
 func (co *Conn) Read(p []byte) (n int, err error) {
+
+	if isDoQ := co.qstream != nil; isDoQ {
+
+		var msglength uint16
+		if err := binary.Read(*co.qstream, binary.BigEndian, &msglength); err != nil {
+			return 0, err
+		}
+		// p = AcquireBuf(msglength)
+
+		// respBuf := p
+		// var buff *bytes.Buffer = bytes.NewBuffer(respBuf)
+		var n int
+		//n, err = io.ReadFull(*co.qstream, p)
+		n, err = io.ReadAtLeast(*co.qstream, p, int(msglength))
+		if err != nil {
+			fmt.Printf("readFull failed: %v read: %v \n", err.Error(), n)
+			return n, err
+		}
+		if n > int(msglength) {
+			fmt.Printf("read more(%v) than message size(%v). Probably more than one response on the same stream \n", n, msglength)
+		}
+		return n, nil
+	}
+
 	if co.Conn == nil {
 		return 0, ErrConnEmpty
 	}
