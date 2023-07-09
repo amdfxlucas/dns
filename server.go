@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -55,7 +54,7 @@ type DoHWriter struct {
 	laddr net.Addr
 
 	// request is the HTTP request we're currently handling.
-	request *http.Request
+	//request *http.Request
 	// protocol i.e. udp, tcp, quic
 	//proto string
 }
@@ -67,7 +66,7 @@ func (d *DoHWriter) RemoteAddr() net.Addr { return d.raddr }
 func (d *DoHWriter) LocalAddr() net.Addr { return d.laddr }
 
 // Request returns the HTTP request
-func (d *DoHWriter) Request() *http.Request { return d.request }
+//func (d *DoHWriter) Request() *http.Request { return d.request }
 
 // Default maximum number of TCP queries before we close the socket.
 const maxTCPQueries = 128

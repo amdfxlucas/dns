@@ -22,6 +22,10 @@ type Transfer struct {
 	tsigTimersOnly bool
 }
 
+func (t *Transfer) Close() error {
+	return t.Conn.Close()
+}
+
 func (t *Transfer) tsigProvider() TsigProvider {
 	if t.TsigProvider != nil {
 		return t.TsigProvider
@@ -44,7 +48,6 @@ func (t *Transfer) tsigProvider() TsigProvider {
 //	dnscon := &dns.Conn{Conn:con}
 //	transfer = &dns.Transfer{Conn: dnscon}
 //	channel, err := transfer.In(message, master)
-//
 func (t *Transfer) In(q *Msg, a string) (env chan *Envelope, err error) {
 	switch q.Question[0].Qtype {
 	case TypeAXFR, TypeIXFR:
