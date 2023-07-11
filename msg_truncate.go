@@ -96,6 +96,115 @@ func (dns *Msg) Truncate(size int) {
 	}
 }
 
+/*
+	this method will slice the message 'dns' into segments of size 'size',
+
+which can then be sent over the wire
+*/
+func (dns *Msg) TruncateNoDiscard(size int) (responses []*Msg) {
+	if dns.IsTsig() != nil {
+		// To simplify this implementation, we don't perform
+		// truncation on responses with a TSIG record.
+		return []*Msg{dns}
+	}
+
+	// RFC 6891 mandates that the payload size in an OPT record
+	// less than 512 (MinMsgSize) bytes must be treated as equal to 512 bytes.
+	//
+	// For ease of use, we impose that restriction here.
+	if size < MinMsgSize {
+		size = MinMsgSize
+	}
+
+	tmp := dns.Copy()
+
+startTruncation:
+
+	l := msgLenWithCompressionMap(tmp, nil) // uncompressed length
+	if l <= size {
+		// Don't waste effort compressing this message.
+		tmp.Compress = false
+		responses = append(responses, tmp)
+		return responses
+	}
+
+	tmp.Compress = true
+
+	edns0 := tmp.popEdns0()
+	if edns0 != nil {
+		// Account for the OPT record that gets added at the end,
+		// by subtracting that length from our budget.
+		//
+		// The EDNS(0) OPT record must have the root domain and
+		// it's length is thus unaffected by compression.
+		size -= Len(edns0)
+	}
+
+	compression := make(map[string]struct{})
+
+	l = headerSize
+	for _, r := range tmp.Question {
+		l += r.len(l, compression)
+	}
+
+	var numAnswer int
+	if l < size {
+		l, numAnswer = truncateLoop(tmp.Answer, size, l, compression)
+	}
+
+	var numNS int
+	if l < size {
+		l, numNS = truncateLoop(tmp.Ns, size, l, compression)
+	}
+
+	var numExtra int
+	if l < size {
+		_, numExtra = truncateLoop(tmp.Extra, size, l, compression)
+	}
+
+	// See the function documentation for when we set this.
+	isTmpTrunc := tmp.Truncated || len(tmp.Answer) > numAnswer ||
+		len(tmp.Ns) > numNS || len(tmp.Extra) > numExtra
+
+	if isTmpTrunc {
+		segment := new(Msg)
+		segment.Id = tmp.Id
+		segment.Compress = true
+		segment.Response = tmp.Response
+		segment.Opcode = tmp.Opcode
+		if dns.Opcode == OpcodeQuery {
+			segment.RecursionDesired = tmp.RecursionDesired // Copy rd bit
+			segment.CheckingDisabled = tmp.CheckingDisabled // Copy cd bit
+		}
+		segment.Rcode = dns.Rcode
+		if len(tmp.Question) > 0 {
+			segment.Question = make([]Question, 1)
+			segment.Question[0] = tmp.Question[0]
+		}
+
+		segment.Answer = tmp.Answer[:numAnswer]
+		segment.Ns = tmp.Ns[:numNS]
+		segment.Extra = tmp.Extra[:numExtra]
+		if edns0 != nil {
+			// Add the OPT record back onto the additional section.
+			segment.Extra = append(tmp.Extra, edns0)
+		}
+		responses = append(responses, segment)
+
+		tmp.Answer = tmp.Answer[numAnswer:]
+		tmp.Ns = tmp.Ns[numNS:]
+		tmp.Extra = tmp.Extra[numExtra:]
+		if edns0 != nil {
+			// Add the OPT record back onto the additional section.
+			tmp.Extra = append(tmp.Extra, edns0)
+		}
+		goto startTruncation // repeat until remainder tmp is no longer truncated
+	} else {
+		responses = append(responses, tmp)
+	}
+	return responses
+}
+
 func truncateLoop(rrs []RR, size, l int, compression map[string]struct{}) (int, int) {
 	for i, r := range rrs {
 		if r == nil {

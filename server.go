@@ -111,6 +111,8 @@ type ResponseWriter interface {
 	// Hijack lets the caller take over the connection.
 	// After a call to Hijack(), the DNS package will not do anything with the connection.
 	Hijack()
+
+	SupportsMultiMsg() bool
 }
 
 // A ConnectionStater interface is used by a DNS Handler to access TLS connection state
@@ -134,6 +136,10 @@ type response struct {
 
 	//qstream quic.Stream
 
+}
+
+func (r response) SupportsMultiMsg() bool {
+	return false
 }
 
 // handleRefused returns a HandlerFunc that returns REFUSED for every request it gets.

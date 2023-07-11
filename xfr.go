@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 )
@@ -82,6 +83,49 @@ func (t *Transfer) In(q *Msg, a string) (env chan *Envelope, err error) {
 	return env, nil
 }
 
+/*
+\param msgs array of responses to a request that generated a large answer i.e. zone transfer
+*/
+func joinMsgs(msgs []*Msg) *Msg {
+
+	res := new(Msg)
+	first := true
+	var qname string
+	var qtype uint16
+	for _, m := range msgs {
+		if first {
+
+			qname = m.Question[0].Name
+			qtype = m.Question[0].Qtype
+			res.Id = m.Id
+			res.Response = m.Response
+			// res.Zero =
+			// res.AuthenticatedData =
+			res.Opcode = m.Opcode
+			if m.Opcode == OpcodeQuery {
+				res.RecursionDesired = m.RecursionDesired // Copy rd bit
+				res.CheckingDisabled = m.CheckingDisabled // Copy cd bit
+			}
+			res.Rcode = m.Rcode
+			if len(m.Question) > 0 {
+				res.Question = make([]Question, 1)
+				res.Question[0] = m.Question[0]
+			}
+			first = false
+		}
+		// all messages must be responses to the same request
+		if qname != m.Question[0].Name || qtype != m.Question[0].Qtype {
+			return nil
+		}
+
+		res.Answer = append(res.Answer, m.Answer...)
+		res.Extra = append(res.Extra, m.Extra...)
+		res.Ns = append(res.Ns, m.Ns...)
+	}
+
+	return res
+}
+
 func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 	first := true
 	defer t.Close()
@@ -92,9 +136,14 @@ func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 	}
 	for {
 		t.Conn.SetReadDeadline(time.Now().Add(timeout))
-		in, err := t.ReadMsg()
+		ins, err := t.ReadMsgs()
 		if err != nil {
 			c <- &Envelope{nil, err}
+			return
+		}
+		in := joinMsgs(ins)
+		if in == nil {
+			fmt.Print(" joinMsgs failed in inAxfr \n")
 			return
 		}
 		if q.Id != in.Id {
@@ -226,11 +275,43 @@ func (t *Transfer) Out(w ResponseWriter, q *Msg, ch chan *Envelope) error {
 	return nil
 }
 
+// ReadMsg reads all messages from the transfer connection t.
+func (t *Transfer) ReadMsgs() (msgs []*Msg, err error) {
+
+	buff := bytes.NewBuffer(nil)
+	buff.Grow(MaxMsgSize)
+
+	n, c, sizes, err := t.Conn.ReadBuff(buff)
+	if err != nil && n == 0 {
+		return nil, err
+	}
+	fmt.Printf("received %v responses for zone Transfer request\n", c)
+	p := buff.Bytes()
+	var oldOff = 0
+	for _, sz := range sizes {
+		offset := oldOff + int(sz)
+		m := new(Msg)
+
+		if err := m.Unpack(p[oldOff:offset]); err != nil {
+			return nil, err
+		}
+		if ts, tp := m.IsTsig(), t.tsigProvider(); ts != nil && tp != nil {
+			// Need to work on the original message p, as that was used to calculate the tsig.
+			err = TsigVerifyWithProvider(p[oldOff:offset], tp, t.tsigRequestMAC, t.tsigTimersOnly)
+			t.tsigRequestMAC = ts.MAC
+		}
+		msgs = append(msgs, m)
+		oldOff = int(offset)
+	}
+	return msgs, err
+}
+
 // ReadMsg reads a message from the transfer connection t.
 func (t *Transfer) ReadMsg() (*Msg, error) {
 	m := new(Msg)
 	p := make([]byte, MaxMsgSize)
 	n, err := t.Read(p)
+
 	if err != nil && n == 0 {
 		return nil, err
 	}

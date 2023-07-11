@@ -3,6 +3,7 @@ package dns
 // A client implementation.
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -456,6 +457,73 @@ func (co *Conn) ReadMsgHeader(hdr *Header) ([]byte, error) {
 		*hdr = dh
 	}
 	return p, err
+}
+
+func (co *Conn) ReadBuff(buff *bytes.Buffer) (n int, m int, sizes []uint16, err error) {
+	n = 0 // how many bytes in total did we read
+	m = 0 // how many messages did we read
+
+	if isDoQ := co.qstream != nil; isDoQ {
+		for {
+			//startReadMsg:
+			var msglength uint16
+			if err := binary.Read(*co.qstream, binary.BigEndian, &msglength); err != nil {
+				if m == 0 {
+					return 0, m, sizes, err
+				} else {
+					// we expect io.EOF here
+					return n, m, sizes, nil
+				}
+			}
+			sizes = append(sizes, msglength)
+			// p = AcquireBuf(msglength)
+
+			// respBuf := p
+			// var buff *bytes.Buffer = bytes.NewBuffer(respBuf)
+			//		var n int
+			//n, err = io.ReadFull(*co.qstream, p)
+			//n, err = io.ReadAtLeast(*co.qstream, p, int(msglength))
+			nn, err := io.CopyN(buff, *co.qstream, int64(msglength))
+			if err != nil && err != io.EOF {
+
+				fmt.Printf("readFull failed: %v read: %v instead of %v \n", err.Error(), nn, msglength)
+				n += int(nn)
+
+				return int(nn), m, sizes, err
+			}
+			n += int(nn)
+			m += 1
+
+			/*if n > int64(msglength) {
+				fmt.Printf("read more(%v) than message size(%v). Probably more than one response on the same stream \n", n, msglength)
+			}*/
+		}
+		return int(n), m, sizes, nil
+	}
+
+	if co.Conn == nil {
+		return 0, m, sizes, ErrConnEmpty
+	}
+
+	if isPacketConn(co.Conn) {
+		// UDP connection
+		buff.Grow(MaxMsgSize)
+		n, e := co.Conn.Read(buff.Bytes())
+		return n, 1, sizes, e
+	}
+
+	var length uint16
+	if err := binary.Read(co.Conn, binary.BigEndian, &length); err != nil {
+		return 0, 0, sizes, err
+	}
+	sizes = append(sizes, length)
+	/*if int(length) > len(p) {
+		return 0, io.ErrShortBuffer
+	}*/
+
+	//return io.ReadFull(co.Conn, p[:length])
+	tmp, e := io.Copy(buff, co.Conn)
+	return int(tmp), 1, sizes, e
 }
 
 // Read implements the net.Conn read method.
