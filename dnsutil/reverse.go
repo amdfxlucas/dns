@@ -4,10 +4,39 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 
 	"github.com/netsec-ethz/scion-apps/pkg/pan"
 )
+
+// check if SCION address has a port set
+func HasPort(addr string) bool {
+	addrRegexp := regexp.MustCompile(`(?P<isia>\d+-[\d:A-Fa-f]+,[\d.:\[\]a-z]+):(?P<port>\d+)`)
+
+	match := addrRegexp.FindStringSubmatch(addr)
+
+	return len(match) == 2
+
+}
+
+// adds port to SCION Address if it not yet has one
+func WithPortIfNotSet(addr string, port int) string {
+	addrRegexp := regexp.MustCompile(`(?P<isia>\d+-[\d:A-Fa-f]+,[\d.:\[\]a-z]+):(?P<port>\d+)`)
+
+	match := addrRegexp.FindStringSubmatch(addr)
+
+	if len(match) == 3 {
+		// address already has port
+		//return match[0]
+
+		// if 'addr' is the result of pan.UDPAddr.String() it might have Port set to '0'
+		if match[2] == "0" {
+			return match[1] + ":" + fmt.Sprint(port)
+		}
+	}
+	return match[1] + ":" + fmt.Sprint(port)
+}
 
 func IsSCIONAddress(address string) bool {
 	_, err := pan.ParseUDPAddr(address)

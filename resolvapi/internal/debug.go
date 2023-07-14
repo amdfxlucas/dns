@@ -34,7 +34,7 @@ func main() {
 
 	//	testXLookup()
 
-	if addresses, err := resolvapi.Lookup("dummy.scion.test."); err == nil {
+	if addresses, err := resolvapi.LookupSCIONAddress("dummy.scion.test."); err == nil {
 		fmt.Print(addresses)
 	} else {
 		fmt.Print(err.Error())

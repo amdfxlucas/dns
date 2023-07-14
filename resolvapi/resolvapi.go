@@ -45,7 +45,7 @@ func XLookupStub(address string) (string, error) {
 
 }
 
-func Lookup(domain string) (answer []string, err error) {
+func LookupSCIONAddress(domain string) (answer []string, err error) {
 	var query *dns.Msg = new(dns.Msg)
 	/*query.Question = []dns.Question{{Name: domain, Qtype: dns.TypeA, Qclass: dns.ClassINET},
 		{Name: domain, Qtype: dns.TypeTXT, Qclass: dns.ClassINET},
