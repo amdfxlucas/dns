@@ -45,7 +45,7 @@ type Conn struct {
 	TsigProvider   TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
 	tsigRequestMAC string
 
-	quicEarlySession *pan.QUICEarlySession
+	QuicEarlySession *pan.QUICEarlySession
 	//quicSession      *pan.QUICSession
 	qstream *quic.Stream
 }
@@ -59,6 +59,18 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 		}
 	} else {
 		return c.Conn.SetReadDeadline(t)
+	}
+}
+
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	if c.Conn == nil {
+		if c.qstream != nil {
+			return (*c.qstream).SetWriteDeadline(t)
+		} else {
+			return nil
+		}
+	} else {
+		return c.Conn.SetWriteDeadline(t)
 	}
 }
 
@@ -184,7 +196,7 @@ func (c *Client) DialContext(ctx context.Context, address string) (conn *Conn, e
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, c.getTimeoutForRequest(c.dialTimeout()))
 		defer cancel()
-		conn.quicEarlySession, err = pan.DialQUICEarly(dialCtx, local, remote, nil, nil, hostForSNI, c.TLSConfig, &quic.Config{MaxIdleTimeout: 5 * time.Minute})
+		conn.QuicEarlySession, err = pan.DialQUICEarly(dialCtx, local, remote, nil, nil, hostForSNI, c.TLSConfig, &quic.Config{MaxIdleTimeout: 5 * time.Minute})
 
 		if err != nil {
 			fmt.Printf("dialQUIC failed in dns.Client: %v \n", err.Error())
@@ -606,10 +618,10 @@ func (co *Conn) Write(p []byte) (int, error) {
 	}
 
 	var err error
-	if isDoQ := co.quicEarlySession != nil; isDoQ {
+	if isDoQ := co.QuicEarlySession != nil; isDoQ {
 		var stream quic.Stream
 
-		stream, err = co.quicEarlySession.OpenStreamSync(context.Background())
+		stream, err = co.QuicEarlySession.OpenStreamSync(context.Background())
 
 		if err != nil {
 			fmt.Printf("failed to open Stream: %v \n", err.Error())
