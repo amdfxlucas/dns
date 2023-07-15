@@ -31,11 +31,26 @@ type dnsResolver struct {
 
 type dnsTXTResolver interface {
 	LookupTXT(context.Context, string) ([]string, error)
+	LookupAddr(context.Context, string) ([]string, error) // reverse lookup of domain names corresponding to an address
 }
 
 var _ resolver = &dnsResolver{}
 
 const scionAddrTXTTag = "scion="
+
+/*
+	lookup domain names for address
+
+\param reverseAddress can be a reverse scion address like 1.0.0.127.in-addr.19-ffaa-1-fe4.scion.arpa.
+or a normal scion address like 17-ffaa:0:1,[192.168.1.1]
+*/
+func (d *dnsResolver) LookupAddr(ctx context.Context, addr string) ([]string, error) {
+	// return d.res.LookupAddr(ctx, addr)
+	// only a stub, this wont work as netresolver does not know howto reverse scion addr
+	// if net.Resolver only had a public LookupPTR() method :(
+
+	return nil, errors.New("NotImplemented")
+}
 
 // Resolve the name via DNS to return one scionAddr or an error.
 func (d *dnsResolver) Resolve(ctx context.Context, name string) (saddr pan.UDPAddr, err error) {

@@ -32,7 +32,7 @@ func TestCount(t *testing.T) {
 		t.Fatal("error loading test file", err)
 	}
 
-	assert.Equal(t, 5, len(hosts), "wrong number of hosts read from hosts_test_file")
+	assert.Equal(t, 5, len(hosts.addresses), "wrong number of hosts read from hosts_test_file")
 }
 
 func TestHostsfileResolver(t *testing.T) {
@@ -56,6 +56,28 @@ func TestHostsfileResolver(t *testing.T) {
 	}
 	for _, c := range cases {
 		actual, err := resolver.Resolve(context.TODO(), c.name)
+		if !c.assertErr(t, err) {
+			continue
+		}
+		assert.Equal(t, c.expected, actual)
+	}
+
+}
+
+func TestHostfileResolverReverse(t *testing.T) {
+	resolver := &hostsfileResolver{hostsTestFile}
+	revcases := []struct {
+		address   string
+		assertErr assert.ErrorAssertionFunc
+		expected  []string
+	}{
+
+		{"1.0.0.127.in-addr.19-ffaa-1-fe4.scion.arpa.", assert.NoError, []string{"rhine.ovgu.scionlab."}},
+		{"111.7.44.141.in-addr.arpa.", assert.NoError, []string{"www.ovgu.de"}},
+		{"115.7.44.141.in-addr.arpa.", assert.NoError, []string{"www.fin.ovgu.de", "www2.cs.ovgu.de"}},
+	}
+	for _, c := range revcases {
+		actual, err := resolver.LookupAddr(context.TODO(), c.address)
 		if !c.assertErr(t, err) {
 			continue
 		}
@@ -110,6 +132,10 @@ type dummyResolver struct {
 }
 
 var _ resolver = &dummyResolver{}
+
+func (r dummyResolver) LookupAddr(ctx context.Context, address string) ([]string, error) {
+	return nil, nil
+}
 
 func (r dummyResolver) Resolve(ctx context.Context, name string) (pan.UDPAddr, error) {
 	if h, ok := r.hosts[name]; ok {

@@ -5,24 +5,27 @@ import (
 	"fmt"
 
 	"github.com/miekg/dns/resolvapi"
+	"golang.org/x/exp/slices"
 )
 
 func testXLookup() {
 	tests := []struct {
 		address string
-		domain  string
+		domain  []string
 	}{
-		{"19-ffaa:1:1067,10.0.2.15", "ns2.scion.test."},
-		{"19-ffaa:1:1094,[127.0.0.1]", "scnd2.scion.test."},
-		{"19-ffaa:1:fe4,127.0.0.1", "rhine.ovgu.scionlab."},
+		{"19-ffaa:1:1067,10.0.2.15", []string{"ns2.scion.test."}},
+		{"19-ffaa:1:1094,[127.0.0.1]", []string{"scnd2.scion.test."}},
+		{"19-ffaa:1:fe4,127.0.0.1", []string{"rhine.ovgu.scionlab."}},
 	}
 
 	for _, d := range tests {
-		if name, err := resolvapi.XLookupStub(d.address); err == nil {
-			if name != d.domain {
-				fmt.Printf("Error rDNS lookup of: %v got domain name: %v\n", d.address, name)
-			} else {
-				fmt.Printf("rDNS lookup successful: %v %v\n", d.address, d.domain)
+		if names, err := resolvapi.XLookupStub(d.address); err == nil {
+			for _, dname := range d.domain {
+				if !slices.Contains(names, dname) {
+					fmt.Printf("Error rDNS lookup of: %v got domain name: %v\n", d.address, dname)
+				} /*else {
+					fmt.Printf("rDNS lookup successful: %v %v\n", d.address, d.domain)
+				}*/
 			}
 
 		} else {
@@ -40,7 +43,7 @@ func TestResolveUDPAddr() {
 
 		{"dummy.scion.test.:53", "19-ffaa:1:1067,[127.0.0.2]"},
 		{"example.scion.test.:53", "19-ffaa:1:1067,[127.0.0.3]"},
-		{"netsec.ethz.ch.:443", "17-ffaa:0:1102,[129.132.121.164]"},
+		{"netsec.ethz.ch.:443", "17-ffaa:0:1102,[129.132.121.164]"}, // this one will use the net.Resolver fallthrough
 	}
 
 	for _, d := range tests {

@@ -57,6 +57,29 @@ func resolveUDPAddrAt(ctx context.Context, address string, resolver resolver) (p
 	return host.WithPort(uint16(port)), nil
 }
 
+func lookupUDPAddrAt(ctx context.Context, address string, resolver resolver) ([]string, error) {
+	hostStr, _, err := net.SplitHostPort(address)
+	if err == nil {
+		return []string{hostStr}, err
+	}
+
+	_, err = pan.ParseUDPAddr(address)
+	if err != nil {
+		return nil, errors.New("address was no valid scion address")
+	}
+
+	/*	port, err := strconv.ParseUint(portStr, 10, 16)
+		if err != nil {
+			return pan.UDPAddr{}, err
+		}
+	*/
+	hostnames, err := resolver.LookupAddr(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	return hostnames, nil
+}
+
 // defaultResolver returns the default name resolver, used in ResolveUDPAddr.
 // It will use the following sources, in the given order of precedence, to
 // resolve a name:
@@ -84,6 +107,9 @@ type resolver interface {
 	// Returns a HostNotFoundError if the name was not found, but otherwise no
 	// error occurred.
 	Resolve(ctx context.Context, name string) (pan.UDPAddr, error)
+
+	// finds a domain name for a SCION address
+	LookupAddr(ctx context.Context, addr string) ([]string, error)
 }
 
 // resolverList represents a list of Resolvers that are processed in sequence
@@ -116,4 +142,32 @@ func (resolvers resolverList) Resolve(ctx context.Context, name string) (pan.UDP
 		return pan.UDPAddr{}, fmt.Errorf("pan library: resolver error: %w", rerr)
 	}
 	return pan.UDPAddr{}, pan.HostNotFoundError{name}
+}
+
+func (resolvers resolverList) LookupAddr(ctx context.Context, addr string) ([]string, error) {
+	var errHostNotFound pan.HostNotFoundError
+	var rerr error
+	for _, resolver := range resolvers {
+		if resolver == nil {
+			// skip RAINS resolver when disabled
+			continue
+		}
+		// check ctx to avoid unnecessary calls with already expired context
+		if err := ctx.Err(); err != nil {
+			rerr = err
+			break
+		}
+		names, err := resolver.LookupAddr(ctx, addr)
+		if err == nil {
+			return names, nil
+		} else if !errors.As(err, &errHostNotFound) {
+			// do not directly fail on first resolver error
+			rerr = err
+		}
+	}
+	if rerr != nil {
+		// fmt.Fprintf(os.Stderr, "pan library: resolver error: %w", rerr)
+		return nil, fmt.Errorf("pan library: resolver error: %w", rerr)
+	}
+	return nil, pan.HostNotFoundError{addr}
 }

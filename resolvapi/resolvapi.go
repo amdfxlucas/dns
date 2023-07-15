@@ -32,6 +32,26 @@ func ResolveUDPAddr(ctx context.Context, address string) (pan.UDPAddr, error) {
 	return resolveUDPAddrAt(ctx, address, defaultResolver())
 }
 
+// lookup domain names corresponding to the given scion address
+func LookupUDPAddr(ctx context.Context, addr string) ([]string, error) {
+	return lookupUDPAddrAt(ctx, addr, defaultResolver())
+}
+
+// lookup domain names corresponding to the given scion address using only hostsfile
+func LookupUDPAddrHostsfile(ctx context.Context, addr string) ([]string, error) {
+	if hostsfileRes, ok := defaultResolver().(resolverList); ok {
+		return lookupUDPAddrAt(ctx, addr, hostsfileRes[:3])
+	}
+	return nil, nil
+}
+
+func ResolveUDPAddrHostsfile(ctx context.Context, address string) (pan.UDPAddr, error) {
+	if hostsfileRes, ok := defaultResolver().(resolverList); ok {
+		return resolveUDPAddrAt(ctx, address, hostsfileRes[:3])
+	}
+	return pan.UDPAddr{}, nil
+}
+
 //---------------------------------------------------------------------------------------------
 /* resolves any queries using the local sdns resolver instance listening under 'lokalResolverAddress' */
 type lokalDNSPrivacyResolver struct {
@@ -46,6 +66,16 @@ var _ resolver = &lokalDNSPrivacyResolver{}
 
 func (r *lokalDNSPrivacyResolver) LookupTXT(ctx context.Context, dname string) ([]string, error) {
 	return LookupSCIONAddress(dname)
+}
+
+/*
+	lookup domain names for address
+
+\param reverseAddress can be a reverse scion address like 1.0.0.127.in-addr.19-ffaa-1-fe4.scion.arpa.
+or a normal scion address like 17-ffaa:0:1,[192.168.1.1]
+*/
+func (r *lokalDNSPrivacyResolver) LookupAddr(ctx context.Context, addr string) ([]string, error) {
+	return XLookupStub(addr)
 }
 
 //const scionAddrTXTTag = "scion="
@@ -101,11 +131,11 @@ func (d *lokalDNSPrivacyResolver) queryTXTRecord(ctx context.Context, host strin
 // inverse lookup
 // ask local stub resolver 127.0.0.1:53  for the domain-name with this address
 // makes no difference between IP and SCION Addresses both are threated as strings
-func XLookupStub(address string) (string, error) {
+func XLookupStub(address string) ([]string, error) {
 	var query *dns.Msg = new(dns.Msg)
 	invaddr, err := dnsutil.AddressToReverse(address)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	query.SetQuestion(invaddr, dns.TypePTR)
 
@@ -114,21 +144,31 @@ func XLookupStub(address string) (string, error) {
 	response, _, err := client.Exchange(query, lokalResolverAddress)
 
 	if err == nil {
+
 		// parse response.Answer here
 		//return response.Answer[0].String(), nil
 
 		if len(response.Answer) > 0 { // maybe redundant, because implied by dns.RCodeSuccess
-			var ans dns.RR = response.Answer[0] // how to handle more than one Answer here ?!
+
+			var hostnames []string
+			/*var ans dns.RR = response.Answer[0] // how to handle more than one Answer here ?!
 			a := ans.(*dns.PTR)
 			if a != nil {
 				return a.Ptr, nil
 			} else {
 				return "", nil
+			}*/
+			for _, ans := range response.Answer {
+				a := ans.(*dns.PTR)
+				if a != nil {
+					hostnames = append(hostnames, a.Ptr)
+				}
 			}
+			return hostnames, nil
 		}
 
 	}
-	return "", err
+	return nil, err
 
 }
 
@@ -149,13 +189,13 @@ func LookupSCIONAddress(domain string) (answer []string, err error) {
 		if len(response.Answer) > 0 { // maybe redundant, because implied by dns.RCodeSuccess
 			//var ans dns.RR = response.Answer[0]
 			for _, ans := range response.Answer {
-				if a, ok := ans.(*dns.A); ok {
-					answer = append(answer, a.A.String())
-				}
+				/*	if a, ok := ans.(*dns.A); ok {
+						answer = append(answer, a.A.String())
+					}
 
-				if aaaa, ok := ans.(*dns.AAAA); ok {
-					answer = append(answer, aaaa.AAAA.String())
-				}
+					if aaaa, ok := ans.(*dns.AAAA); ok {
+						answer = append(answer, aaaa.AAAA.String())
+					}*/
 				if a, ok := ans.(*dns.TXT); ok {
 					answer = append(answer, strings.Join(a.Txt, ""))
 				}
