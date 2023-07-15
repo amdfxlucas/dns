@@ -10,6 +10,32 @@ import (
 	"github.com/netsec-ethz/scion-apps/pkg/pan"
 )
 
+//TODO: move to pan
+
+/*
+extract a SCION address from a string i.E.:
+"'19-ffaa:1:1094,[127.0.0.1]'" => "19-ffaa:1.1094,[127.0.0.1]"
+
+"scion=19-ffaa:1:1067,[127.0.0.1]" => 19-ffaa:1:1067,[127.0.0.1]
+return empty-string if not found
+*/
+func SCIONAddrFromString(addr string) string {
+	addrRegexp := regexp.MustCompile(`(?P<ia>\d+-[\d:A-Fa-f]+),(?P<host>[\d.:\[\]a-z]+)`)
+
+	match := addrRegexp.FindStringSubmatch(addr)
+	if len(match) != 3 {
+		return "" // serrors.New("invalid address: regex match failed", "addr", s)
+	}
+	left, right := strings.Count(addr, "["), strings.Count(addr, "]")
+	if left != right {
+		return "" // serrors.New("invalid address: bracket count mismatch", "addr", s)
+	}
+	if strings.HasSuffix(match[2], ":") {
+		return "" // ,  serrors.New("invalid address: trailing ':'", "addr", s)
+	}
+	return match[1] + "," + match[2]
+}
+
 // check if SCION address has a port set
 func HasPort(addr string) bool {
 	addrRegexp := regexp.MustCompile(`(?P<isia>\d+-[\d:A-Fa-f]+,[\d.:\[\]a-z]+):(?P<port>\d+)`)
